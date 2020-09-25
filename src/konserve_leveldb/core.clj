@@ -15,21 +15,17 @@
                                         -serialize -deserialize
                                         PKeyIterable
                                         -keys]]
-            [konserve.storage-layout :refer [LinearLayout]])
-  (:import  [java.io ByteArrayOutputStream ByteArrayInputStream]
-            [java.nio ByteBuffer]
+            [konserve.storage-layout :refer [SplitLayout]])
+  (:import  [java.io ByteArrayOutputStream]
             [org.iq80.leveldb DB]))
 
 (set! *warn-on-reflection* 1)
 
-(def store-layout 0)
+(def store-layout 1)
 
 (defn str-uuid 
   [key] 
   (str (hasch/uuid key))) 
-
-(defn make-bais [sub-vector]
-  (->> sub-vector (into []) byte-array (ByteArrayInputStream.)))
 
 (defn prep-ex 
   [^String message ^Exception e]
@@ -57,16 +53,13 @@
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (let [res (io/get-it db (str-uuid key))
-                [header msize data''] res]
-            (if res
-              (let [data' (vec data'')
-                    mserializer (ser/byte->serializer  (get header 1))
-                    mcompressor (comp/byte->compressor (get header 2))
-                    mencryptor  (encr/byte->encryptor  (get header 3))
-                    meta-len (-> (ByteBuffer/wrap msize) (.getInt))
-                    reader (-> mserializer mencryptor mcompressor)
-                    data (-deserialize reader read-handlers (make-bais (drop meta-len data')))]
+          (let [[header res] (io/get-it-only db (str-uuid key))]
+            (if (some? res) 
+              (let [rserializer (ser/byte->serializer (get header 1))
+                    rcompressor (comp/byte->compressor (get header 2))
+                    rencryptor  (encr/byte->encryptor  (get header 3))
+                    reader (-> rserializer rencryptor rcompressor)
+                    data (-deserialize reader read-handlers res)]
                 (async/put! res-ch data))
               (async/close! res-ch)))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve value from store" e)))))
@@ -77,17 +70,14 @@
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (let [res (io/get-it db (str-uuid key))
-                [header msize data''] res]
-            (if res
-              (let [data' (vec data'')
-                    mserializer (ser/byte->serializer  (get header 1))
-                    mcompressor (comp/byte->compressor (get header 2))
-                    mencryptor  (encr/byte->encryptor  (get header 3))
-                    meta-len (-> (ByteBuffer/wrap msize) (.getInt))
-                    reader (-> mserializer mencryptor mcompressor)
-                    meta (-deserialize reader read-handlers (make-bais (take meta-len data')))]
-                (async/put! res-ch meta))
+          (let [[header res] (io/get-meta db (str-uuid key))]
+            (if (some? res) 
+              (let [rserializer (ser/byte->serializer (get header 1))
+                    rcompressor (comp/byte->compressor (get header 2))
+                    rencryptor  (encr/byte->encryptor  (get header 3))
+                    reader (-> rserializer rencryptor rcompressor)
+                    data (-deserialize reader read-handlers res)] 
+                (async/put! res-ch data))
               (async/close! res-ch)))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve metadata from store" e)))))
       res-ch))
@@ -98,33 +88,38 @@
       (async/thread
         (try
           (let [[fkey & rkey] key-vec
-                res (io/get-it db (str-uuid fkey))
-                [header msize data''] res
-                old-val (when res
-                            (let [data' (vec data'')
-                                  mserializer (ser/byte->serializer  (get header 1))
-                                  mcompressor (comp/byte->compressor (get header 2))
-                                  mencryptor  (encr/byte->encryptor  (get header 3))
-                                  meta-len (-> (ByteBuffer/wrap msize) (.getInt))
+                [[mheader ometa'] [vheader oval']] (io/get-it db (str-uuid fkey))
+                old-val [(when ometa'
+                            (let [mserializer (ser/byte->serializer  (get mheader 1))
+                                  mcompressor (comp/byte->compressor (get mheader 2))
+                                  mencryptor  (encr/byte->encryptor  (get mheader 3))
                                   reader (-> mserializer mencryptor mcompressor)]
-                              [(-deserialize reader read-handlers (make-bais (take meta-len data')))
-                               (-deserialize reader read-handlers (make-bais (drop meta-len data')))]))
+                              (-deserialize reader read-handlers ometa')))
+                         (when oval'
+                            (let [vserializer (ser/byte->serializer  (get vheader 1))
+                                  vcompressor (comp/byte->compressor (get vheader 2))
+                                  vencryptor  (encr/byte->encryptor  (get vheader 3))
+                                  reader (-> vserializer vencryptor vcompressor)]
+                              (-deserialize reader read-handlers oval')))]            
                 [nmeta nval] [(meta-up-fn (first old-val)) 
                               (if rkey (apply update-in (second old-val) rkey up-fn args) (apply up-fn (second old-val) args))]
                 serializer (get serializers default-serializer)
                 writer (-> serializer compressor encryptor)
                 ^ByteArrayOutputStream mbaos (ByteArrayOutputStream.)
-                ^ByteArrayOutputStream vbaos (ByteArrayOutputStream.)
-                meta-size (ByteBuffer/allocate 4)]
-            (when nmeta (-serialize writer mbaos write-handlers nmeta))
-            (when nval (-serialize writer vbaos write-handlers nval))    
-            (io/update-it db (str-uuid fkey) (byte-array (mapcat seq [[store-layout 
-                                                                       (ser/serializer-class->byte (type serializer)) 
-                                                                       (comp/compressor->byte compressor)
-                                                                       (encr/encryptor->byte encryptor)] 
-                                                                      (-> meta-size (.putInt (.size mbaos)) .array)
-                                                                      (.toByteArray mbaos) 
-                                                                      (.toByteArray vbaos)])))
+                ^ByteArrayOutputStream vbaos (ByteArrayOutputStream.)]
+            (when nmeta 
+              (.write mbaos ^byte store-layout)
+              (.write mbaos ^byte (ser/serializer-class->byte (type serializer)))
+              (.write mbaos ^byte (comp/compressor->byte compressor))
+              (.write mbaos ^byte (encr/encryptor->byte encryptor))
+              (-serialize writer mbaos write-handlers nmeta))
+            (when nval 
+              (.write vbaos ^byte store-layout)
+              (.write vbaos ^byte (ser/serializer-class->byte (type serializer)))
+              (.write vbaos ^byte (comp/compressor->byte compressor))
+              (.write vbaos ^byte (encr/encryptor->byte encryptor))
+              (-serialize writer vbaos write-handlers nval))    
+            (io/update-it db (str-uuid fkey) [(.toByteArray mbaos) (.toByteArray vbaos)])
             (async/put! res-ch [(second old-val) nval]))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to update/write value in store" e)))))
         res-ch))
@@ -147,16 +142,13 @@
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (let [res (io/get-it db (str-uuid key))
-                [header msize data''] res]
-            (if res
-               (let [data' (vec data'')
-                    mserializer (ser/byte->serializer  (get header 1))
-                    mcompressor (comp/byte->compressor (get header 2))
-                    mencryptor  (encr/byte->encryptor  (get header 3))
-                    meta-len (-> (ByteBuffer/wrap msize) (.getInt))
-                    reader (-> mserializer mencryptor mcompressor)
-                    data (-deserialize reader read-handlers (make-bais (drop meta-len data')))]
+          (let [[header res] (io/get-it-only db (str-uuid key))]
+            (if (some? res) 
+              (let [rserializer (ser/byte->serializer (get header 1))
+                    rcompressor (comp/byte->compressor (get header 2))
+                    rencryptor  (encr/byte->encryptor  (get header 3))
+                    reader (-> rserializer rencryptor rcompressor)
+                    data (-deserialize reader read-handlers res)]
                 (async/put! res-ch (locked-cb (prep-stream data))))
               (async/close! res-ch)))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve binary value from store" e)))))
@@ -167,32 +159,31 @@
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (let [res (io/get-it db (str-uuid key))
-                [header msize data''] res
-                [old-meta old-val] (when res
-                            (let [data' (vec data'')
-                                  mserializer (ser/byte->serializer  (get header 1))
-                                  mcompressor (comp/byte->compressor (get header 2))
-                                  mencryptor  (encr/byte->encryptor  (get header 3))
-                                  meta-len (-> (ByteBuffer/wrap msize) (.getInt))
+          (let [[[mheader old-meta'] [_ old-val]] (io/get-it db (str-uuid key))
+                old-meta (when old-meta' 
+                            (let [mserializer (ser/byte->serializer  (get mheader 1))
+                                  mcompressor (comp/byte->compressor (get mheader 2))
+                                  mencryptor  (encr/byte->encryptor  (get mheader 3))
                                   reader (-> mserializer mencryptor mcompressor)]
-                              [(-deserialize reader read-handlers (make-bais (take meta-len data')))
-                               (-deserialize reader read-handlers (make-bais (drop meta-len data')))]))               
+                              (-deserialize reader read-handlers old-meta')))           
                 new-meta (meta-up-fn old-meta) 
                 serializer (get serializers default-serializer)
                 writer (-> serializer compressor encryptor)
                 ^ByteArrayOutputStream mbaos (ByteArrayOutputStream.)
-                ^ByteArrayOutputStream vbaos (ByteArrayOutputStream.)
-                meta-size (ByteBuffer/allocate 4)]
-            (when new-meta (-serialize writer mbaos write-handlers new-meta))
-            (when input (-serialize writer vbaos write-handlers input))  
-            (io/update-it db (str-uuid key) (byte-array (mapcat seq [[store-layout 
-                                                                      (ser/serializer-class->byte (type serializer)) 
-                                                                      (comp/compressor->byte compressor)
-                                                                      (encr/encryptor->byte encryptor)] 
-                                                                    (-> meta-size (.putInt (.size mbaos)) .array)
-                                                                    (.toByteArray mbaos) 
-                                                                    (.toByteArray vbaos)])))
+                ^ByteArrayOutputStream vbaos (ByteArrayOutputStream.)]
+            (when new-meta 
+              (.write mbaos ^byte store-layout)
+              (.write mbaos ^byte (ser/serializer-class->byte (type serializer)))
+              (.write mbaos ^byte (comp/compressor->byte compressor))
+              (.write mbaos ^byte (encr/encryptor->byte encryptor))
+              (-serialize writer mbaos write-handlers new-meta))
+            (when input
+              (.write vbaos ^byte store-layout)
+              (.write vbaos ^byte (ser/serializer-class->byte (type serializer)))
+              (.write vbaos ^byte (comp/compressor->byte compressor))
+              (.write vbaos ^byte (encr/encryptor->byte encryptor))
+              (-serialize writer vbaos write-handlers input))  
+            (io/update-it db (str-uuid key) [(.toByteArray mbaos) (.toByteArray vbaos)])
             (async/put! res-ch [old-val input]))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to write binary value in store" e)))))
         res-ch))
@@ -205,39 +196,55 @@
         (try
           (let [key-stream (io/get-keys db)
                 keys' (when key-stream
-                        (for [[header msize data''] key-stream]
-                          (let [data' (vec data'')
-                                mserializer (ser/byte->serializer  (get header 1))
-                                mcompressor (comp/byte->compressor (get header 2))
-                                mencryptor  (encr/byte->encryptor  (get header 3))
-                                meta-len (-> (ByteBuffer/wrap msize) (.getInt))
-                                reader (-> mserializer mencryptor mcompressor)]
-                            (-deserialize reader read-handlers (make-bais (take meta-len data'))))))
-                keys (doall (map :key keys'))]
+                        (for [[header k] key-stream]
+                          (let [rserializer (ser/byte->serializer (get header 1))
+                                rcompressor (comp/byte->compressor (get header 2))
+                                rencryptor  (encr/byte->encryptor  (get header 3))
+                                reader (-> rserializer rencryptor rcompressor)]
+                            (-deserialize reader read-handlers k))))
+                keys (doall (filter some? (map :key keys')))]
             (doall
               (map #(async/put! res-ch %) keys))
             (async/close! res-ch)) 
           (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve keys from store" e)))))
         res-ch))
         
-  LinearLayout      
-  (-get-raw [this key]
+  SplitLayout      
+  (-get-raw-meta [this key]
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (let [res (io/raw-get db (str-uuid key))]
+          (let [res (io/raw-get-meta db (str-uuid key))]
             (if res
               (async/put! res-ch res)
               (async/close! res-ch)))
           (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve raw metadata from store" e)))))
       res-ch))
-  (-put-raw [this key binary]
+  (-put-raw-meta [this key binary]
     (let [res-ch (async/chan 1)]
       (async/thread
         (try
-          (io/raw-update db (str-uuid key) binary)
+          (io/raw-update-meta db (str-uuid key) binary)
           (async/close! res-ch)
           (catch Exception e (async/put! res-ch (prep-ex "Failed to write raw metadata to store" e)))))
+      res-ch))
+  (-get-raw-value [this key]
+    (let [res-ch (async/chan 1)]
+      (async/thread
+        (try
+          (let [res (io/raw-get-it-only db (str-uuid key))]
+            (if res
+              (async/put! res-ch res)
+              (async/close! res-ch)))
+          (catch Exception e (async/put! res-ch (prep-ex "Failed to retrieve raw value from store" e)))))
+      res-ch))
+  (-put-raw-value [this key binary]
+    (let [res-ch (async/chan 1)]
+      (async/thread
+        (try
+          (io/raw-update-it-only db (str-uuid key) binary)
+          (async/close! res-ch)
+          (catch Exception e (async/put! res-ch (prep-ex "Failed to write raw value to store" e)))))
       res-ch)))
 
 (defn new-leveldb-store

@@ -195,27 +195,45 @@
       (<!! (k/bget store :binary (fn [{:keys [input-stream]}]
                                     (is (= (pmap byte (slurp input-stream))
                                            sevens)))))
-      (delete-store store))))  
+      (delete-store store))))         
 
-(deftest raw-test
-  (testing "Test header and value storage"
-    (let [_ (println "Checking if headers and values are stored correctly")
-          path "./temp/raw-test"
+(deftest raw-meta-test
+  (testing "Test header storage"
+    (let [_ (println "Checking if headers are stored correctly")
+          path "./temp/raw-meta-test"
           store (<!! (new-leveldb-store path))]
       (<!! (k/assoc store :foo :bar))
       (<!! (k/assoc store :eye :ear))
-      (let [raw (<!! (kl/-get-raw store :foo))
-            raw2 (<!! (kl/-get-raw store :eye))
-            raw3 (<!! (kl/-get-raw store :not-there))
-            header (take 4 (map byte raw))]
-        (<!! (kl/-put-raw store :foo raw2))
-        (<!! (kl/-put-raw store :baritone raw2))
-        (is (= header [0 1 1 0]))
-        (is (nil? raw3))
-        (is (= :ear (<!! (k/get store :baritone))))
-        (is (= (<!! (k/get store :foo)) (<!! (k/get store :baritone))))
-        (is (= (<!! (k/get-meta store :foo)) (<!! (k/get-meta store :baritone)))))
+      (let [mraw (<!! (kl/-get-raw-meta store :foo))
+            mraw2 (<!! (kl/-get-raw-meta store :eye))
+            mraw3 (<!! (kl/-get-raw-meta store :not-there))
+            header (take 4 (map byte mraw))]
+        (<!! (kl/-put-raw-meta store :foo mraw2))
+        (<!! (kl/-put-raw-meta store :baritone mraw2))
+        (is (= header [1 1 1 0]))
+        (is (nil? mraw3))
+        (is (= :eye (:key (<!! (k/get-meta store :foo)))))
+        (is (= :eye (:key (<!! (k/get-meta store :baritone))))))        
       (delete-store store))))          
+
+(deftest raw-value-test
+  (testing "Test value storage"
+    (let [_ (println "Checking if values are stored correctly")
+          path "./temp/raw-value-test"
+          store (<!! (new-leveldb-store path))]
+      (<!! (k/assoc store :foo :bar))
+      (<!! (k/assoc store :eye :ear))
+      (let [vraw (<!! (kl/-get-raw-value store :foo))
+            vraw2 (<!! (kl/-get-raw-value store :eye))
+            vraw3 (<!! (kl/-get-raw-value store :not-there))
+            header (take 4 (map byte vraw))]
+        (<!! (kl/-put-raw-value store :foo vraw2))
+        (<!! (kl/-put-raw-value store :baritone vraw2))
+        (is (= header [1 1 1 0]))
+        (is (nil? vraw3))
+        (is (= :ear (<!! (k/get store :foo))))
+        (is (= :ear (<!! (k/get store :baritone)))))      
+      (delete-store store))))  
 
 (deftest exceptions-test
   (testing "Test exception handling"
@@ -238,7 +256,9 @@
       (is (exception? (<!! (k/keys corrupt))))
       (is (exception? (<!! (k/bget corrupt :bad (fn [_] nil)))))   
       (is (exception? (<!! (k/bassoc corrupt :binbar (byte-array (range 10))))))
-      (is (exception? (<!! (kl/-put-raw corrupt :bad (byte-array (range 10))))))
-      (is (exception? (<!! (kl/-get-raw corrupt :bad))))
+      (is (exception? (<!! (kl/-get-raw-value corrupt :bad))))
+      (is (exception? (<!! (kl/-put-raw-value corrupt :bad (byte-array (range 10))))))
+      (is (exception? (<!! (kl/-get-raw-meta corrupt :bad))))
+      (is (exception? (<!! (kl/-put-raw-meta corrupt :bad (byte-array (range 10))))))
       (is (exception? (<!! (delete-store corrupt))))
       (delete-store store))))
